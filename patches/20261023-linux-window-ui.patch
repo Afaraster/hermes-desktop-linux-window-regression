@@ -1,0 +1,647 @@
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 88228215b9..8cedda9055 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -736,8 +736,8 @@ const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
+ // Glass: macOS vibrancy, or Windows 11 22H2+ system backdrop. Computed once
+ // so the renderer, the persisted default, and every chat window agree.
+ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
+-// Clear rides setOpacity, a documented no-op on Linux, so neither mode works
+-// there and Settings drops the row entirely.
++// Translucency is offered only on macOS and Windows. Keep Linux opaque even
++// on Electron versions where setOpacity works; Settings hides the row there.
+ const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
+ const APP_ROOT = app.getAppPath()
+ 
+@@ -1497,7 +1497,7 @@ nativeTheme.themeSource = readPersistedThemeSource()
+ // — a matte blur with full-contrast text. macOS uses vibrancy; Windows 11
+ // uses DWM acrylic/mica/tabbed. Persisted so a cold launch applies it at
+ // window creation, before the renderer reports its value.
+-// macOS + Windows only; `setOpacity` is a no-op on Linux.
++// macOS + Windows only; native opacity is explicitly gated off on Linux.
+ const TRANSLUCENCY_CONFIG_PATH = path.join(app.getPath('userData'), 'translucency.json')
+ 
+ function readPersistedTranslucency() {
+@@ -1535,7 +1535,7 @@ const translucencyBackedWindows = new WeakSet()
+ // window's own opacity is the record of whether that door was ever opened; see
+ // opacityNeedsSetting for why it matters that it stays shut.
+ function applyWindowOpacity(win) {
+-  const opacity = windowOpacityFor(translucencyState)
++  const opacity = windowOpacityFor(translucencyState, process.platform)
+ 
+   if (typeof win.setOpacity === 'function' && opacityNeedsSetting(opacity, win.getOpacity?.() ?? 1)) {
+     win.setOpacity(opacity)
+@@ -1635,7 +1635,7 @@ function chatWindowSurfaceOptions() {
+     // RESIZABLE transparent window is unsupported and breaks (electron#48421).
+     // Every chat window is resizable.
+     ...windowBackgroundMaterialOptions(translucencyState, IS_WINDOWS, GLASS_SUPPORTED),
+-    ...windowOpacityOptions(translucencyState),
++    ...windowOpacityOptions(translucencyState, process.platform),
+     ...windowBackingOptions(translucencyState, getWindowBackgroundColor())
+   }
+ }
+@@ -16835,7 +16835,7 @@ ipcMain.on('hermes:translucency', (_event, payload) => {
+     // The backing follows whether glass is ON, not the intensity behind it.
+     backing: glassActive(previous) !== glassActive(next),
+     material: vibrancyForTranslucency(previous) !== vibrancyForTranslucency(next),
+-    opacity: windowOpacityFor(previous) !== windowOpacityFor(next)
++    opacity: windowOpacityFor(previous, process.platform) !== windowOpacityFor(next, process.platform)
+   }
+ 
+   scheduleTranslucencyWrite()
+diff --git a/apps/desktop/electron/translucency.test.ts b/apps/desktop/electron/translucency.test.ts
+index 5f4b4fad81..b639140857 100644
+--- a/apps/desktop/electron/translucency.test.ts
++++ b/apps/desktop/electron/translucency.test.ts
+@@ -122,20 +122,20 @@ describe('normalizeMode', () => {
+ 
+ describe('windowOpacityFor', () => {
+   it('leaves both endpoints bit-identical to the linear ramp it replaced', () => {
+-    expect(windowOpacityFor(clear(TRANSLUCENCY_MIN))).toBe(legacyOpacity(0))
+-    expect(windowOpacityFor(clear(TRANSLUCENCY_MAX))).toBe(legacyOpacity(100))
++    expect(windowOpacityFor(clear(TRANSLUCENCY_MIN), 'darwin')).toBe(legacyOpacity(0))
++    expect(windowOpacityFor(clear(TRANSLUCENCY_MAX), 'darwin')).toBe(legacyOpacity(100))
+   })
+ 
+   it('is fully opaque at 0 and exactly the floor at 100', () => {
+-    expect(windowOpacityFor(clear(0))).toBe(1)
+-    expect(windowOpacityFor(clear(100))).toBe(1 - (1 - TRANSLUCENCY_OPACITY_FLOOR))
++    expect(windowOpacityFor(clear(0), 'darwin')).toBe(1)
++    expect(windowOpacityFor(clear(100), 'darwin')).toBe(1 - (1 - TRANSLUCENCY_OPACITY_FLOOR))
+   })
+ 
+   it('decreases monotonically and never sinks below the floor', () => {
+-    let previous = windowOpacityFor(clear(TRANSLUCENCY_MIN))
++    let previous = windowOpacityFor(clear(TRANSLUCENCY_MIN), 'darwin')
+ 
+     for (let intensity = TRANSLUCENCY_MIN + 1; intensity <= TRANSLUCENCY_MAX; intensity += 1) {
+-      const opacity = windowOpacityFor(clear(intensity))
++      const opacity = windowOpacityFor(clear(intensity), 'darwin')
+ 
+       expect(opacity, `${intensity} should be more see-through than ${intensity - 1}`).toBeLessThan(previous)
+       expect(opacity, `${intensity} should stay at or above the floor`).toBeGreaterThanOrEqual(
+@@ -153,7 +153,7 @@ describe('windowOpacityFor', () => {
+     const readable = []
+ 
+     for (let intensity = TRANSLUCENCY_MIN; intensity <= TRANSLUCENCY_MAX; intensity += 1) {
+-      if (windowOpacityFor(clear(intensity)) >= 0.95) {
++      if (windowOpacityFor(clear(intensity), 'darwin') >= 0.95) {
+         readable.push(intensity)
+       }
+     }
+@@ -163,32 +163,36 @@ describe('windowOpacityFor', () => {
+ 
+   it('keeps fine control near the opaque end', () => {
+     // Linear gave 0.965 here — a visible jump off "off" on the very first step.
+-    expect(windowOpacityFor(clear(5))).toBeGreaterThan(0.99)
+-    expect(windowOpacityFor(clear(1))).toBeGreaterThan(legacyOpacity(1))
++    expect(windowOpacityFor(clear(5), 'darwin')).toBeGreaterThan(0.99)
++    expect(windowOpacityFor(clear(1), 'darwin')).toBeGreaterThan(legacyOpacity(1))
+     expect(TRANSLUCENCY_CURVE).toBeGreaterThan(1)
+   })
+ 
+   it('clamps before mapping so corrupt state cannot escape the range', () => {
+-    expect(windowOpacityFor(clear(-40))).toBe(1)
+-    expect(windowOpacityFor(clear(240))).toBe(windowOpacityFor(clear(TRANSLUCENCY_MAX)))
++    expect(windowOpacityFor(clear(-40), 'darwin')).toBe(1)
++    expect(windowOpacityFor(clear(240), 'darwin')).toBe(windowOpacityFor(clear(TRANSLUCENCY_MAX), 'darwin'))
+   })
+ 
+   // The tint is painted by the renderer, so the intensity lever must never
+   // reach setOpacity under glass — that separation is what keeps text sharp.
+   it('ignores the intensity lever entirely in glass mode', () => {
+-    expect(windowOpacityFor(glass(0))).toBe(1)
+-    expect(windowOpacityFor(glass(60))).toBe(1)
+-    expect(windowOpacityFor(glass(100))).toBe(1)
++    expect(windowOpacityFor(glass(0), 'darwin')).toBe(1)
++    expect(windowOpacityFor(glass(60), 'darwin')).toBe(1)
++    expect(windowOpacityFor(glass(100), 'darwin')).toBe(1)
+   })
+ 
+   it('fades a glass window only through its own lever, on the ramp clear uses', () => {
+-    expect(windowOpacityFor(glass(60, DEFAULT_GLASS_MATERIAL, 0))).toBe(1)
+-    expect(windowOpacityFor(glass(60, DEFAULT_GLASS_MATERIAL, 40))).toBe(windowOpacityFor(clear(40)))
+-    expect(windowOpacityFor(glass(100, DEFAULT_GLASS_MATERIAL, 100))).toBe(windowOpacityFor(clear(100)))
++    expect(windowOpacityFor(glass(60, DEFAULT_GLASS_MATERIAL, 0), 'darwin')).toBe(1)
++    expect(windowOpacityFor(glass(60, DEFAULT_GLASS_MATERIAL, 40), 'darwin')).toBe(
++      windowOpacityFor(clear(40), 'darwin')
++    )
++    expect(windowOpacityFor(glass(100, DEFAULT_GLASS_MATERIAL, 100), 'darwin')).toBe(
++      windowOpacityFor(clear(100), 'darwin')
++    )
+   })
+ 
+   it('leaves fade inert under clear, where the intensity lever already is the opacity', () => {
+-    expect(windowOpacityFor({ ...clear(40), fade: 100 })).toBe(windowOpacityFor(clear(40)))
++    expect(windowOpacityFor({ ...clear(40), fade: 100 }, 'darwin')).toBe(windowOpacityFor(clear(40), 'darwin'))
+   })
+ })
+ 
+@@ -330,9 +334,9 @@ describe('translucencySupportedOn', () => {
+     expect(translucencySupportedOn('win32')).toBe(true)
+   })
+ 
+-  // Electron documents setOpacity as doing nothing on Linux, and there is no
+-  // material either — so the setting has no working half to offer there.
+-  it('is off on Linux, where neither mode does anything', () => {
++  // Linux has no first-party glass material. The hidden setting must not fade
++  // the window, even on Electron versions where setOpacity now works.
++  it('is off on Linux and other unsupported platforms', () => {
+     expect(translucencySupportedOn('linux')).toBe(false)
+     expect(translucencySupportedOn('freebsd')).toBe(false)
+   })
+@@ -447,7 +451,7 @@ describe('a fresh profile', () => {
+   })
+ 
+   it('leaves the window exactly as it is today', () => {
+-    expect(windowOpacityFor(fresh)).toBe(1)
++    expect(windowOpacityFor(fresh, 'darwin')).toBe(1)
+     expect(windowBackingOptions(fresh, '#101014')).toEqual({ backgroundColor: '#101014' })
+   })
+ })
+@@ -493,13 +497,13 @@ describe('windowBackgroundMaterialOptions', () => {
+ // moment it lost focus. The no-op ask has to not be made.
+ describe('windowOpacityOptions', () => {
+   it('omits opacity entirely when the window is fully opaque', () => {
+-    expect(windowOpacityOptions(glass(60))).toStrictEqual({})
+-    expect(windowOpacityOptions(clear(0))).toStrictEqual({})
++    expect(windowOpacityOptions(glass(60), 'darwin')).toStrictEqual({})
++    expect(windowOpacityOptions(clear(0), 'darwin')).toStrictEqual({})
+   })
+ 
+   it('passes it the moment the state actually fades', () => {
+     for (const state of [clear(1), clear(100), glass(60, DEFAULT_GLASS_MATERIAL, 1)]) {
+-      expect(windowOpacityOptions(state)).toStrictEqual({ opacity: windowOpacityFor(state) })
++      expect(windowOpacityOptions(state, 'darwin')).toStrictEqual({ opacity: windowOpacityFor(state, 'darwin') })
+     }
+   })
+ 
+@@ -510,7 +514,7 @@ describe('windowOpacityOptions', () => {
+     for (const appearance of ['light', 'dark'] as const) {
+       const state = { ...defaultTranslucencyValues(appearance, true), mode: 'glass' as const }
+ 
+-      expect(windowOpacityOptions(state), appearance).toStrictEqual({})
++      expect(windowOpacityOptions(state, 'win32'), appearance).toStrictEqual({})
+     }
+   })
+ })
+@@ -540,7 +544,7 @@ describe('what an update actually changes natively', () => {
+   const nativeDiff = (previous: TranslucencyState, next: TranslucencyState) => ({
+     backing: glassActive(previous) !== glassActive(next),
+     material: vibrancyFor(previous) !== vibrancyFor(next),
+-    opacity: windowOpacityFor(previous) !== windowOpacityFor(next)
++    opacity: windowOpacityFor(previous, 'darwin') !== windowOpacityFor(next, 'darwin')
+   })
+ 
+   it('is nothing at all while dragging intensity under glass', () => {
+@@ -588,12 +592,12 @@ describe('what an update actually changes natively', () => {
+ 
+   it('leaves a window alone when glass is selected but off', () => {
+     // A saved fade must not follow the tint to zero: off means opaque.
+-    expect(windowOpacityFor({ ...glass(0), fade: 1 })).toBe(1)
+-    expect(windowOpacityFor({ ...glass(0), fade: 40 })).toBe(1)
++    expect(windowOpacityFor({ ...glass(0), fade: 1 }, 'darwin')).toBe(1)
++    expect(windowOpacityFor({ ...glass(0), fade: 40 }, 'darwin')).toBe(1)
+   })
+ 
+   it('still fades a window whose glass is actually on', () => {
+-    expect(windowOpacityFor({ ...glass(66), fade: 40 })).toBeLessThan(1)
++    expect(windowOpacityFor({ ...glass(66), fade: 40 }, 'darwin')).toBeLessThan(1)
+   })
+ })
+ 
+@@ -620,7 +624,7 @@ describe('the defaults a fresh profile lands on', () => {
+ 
+   it('keeps the content column opaque at the native level', () => {
+     for (const values of [mac('light'), mac('dark'), win('light'), win('dark')]) {
+-      expect(windowOpacityFor({ ...values, mode: 'glass' })).toBe(1)
++      expect(windowOpacityFor({ ...values, mode: 'glass' }, 'darwin')).toBe(1)
+     }
+   })
+ 
+diff --git a/apps/desktop/electron/translucency.ts b/apps/desktop/electron/translucency.ts
+index 2035392cb4..5a176d121a 100644
+--- a/apps/desktop/electron/translucency.ts
++++ b/apps/desktop/electron/translucency.ts
+@@ -145,8 +145,8 @@ export function opacityNeedsSetting(next: number, current = 1): boolean {
+  * BrowserWindow constructor options for a chat window's native opacity. Empty
+  * unless the state actually asks the window to fade — see opacityNeedsSetting.
+  */
+-export function windowOpacityOptions(state: TranslucencyState): { opacity?: number } {
+-  const opacity = windowOpacityFor(state)
++export function windowOpacityOptions(state: TranslucencyState, platform: string): { opacity?: number } {
++  const opacity = windowOpacityFor(state, platform)
+ 
+   return opacityNeedsSetting(opacity) ? { opacity } : {}
+ }
+diff --git a/apps/desktop/src/app/contrib/wiring-background-queue-drain.test.tsx b/apps/desktop/src/app/contrib/wiring-background-queue-drain.test.tsx
+index b7a49376f3..190e0265a1 100644
+--- a/apps/desktop/src/app/contrib/wiring-background-queue-drain.test.tsx
++++ b/apps/desktop/src/app/contrib/wiring-background-queue-drain.test.tsx
+@@ -137,7 +137,9 @@ vi.mock('./panes', async () => {
+ 
+   return { $restartPreviewServer: atom(null), useTitlebarToolContributions: () => [] }
+ })
+-vi.mock('../shell/hooks/use-window-controls-overlay-width', () => ({ useWindowControlsOverlayWidth: () => 0 }))
++vi.mock('../shell/hooks/use-window-controls-overlay-width', () => ({
++  useWindowControlsOverlayInsets: () => ({ left: 0, right: 0 })
++}))
+ 
+ import { ContribWiring } from './wiring'
+ 
+diff --git a/apps/desktop/src/app/contrib/wiring.tsx b/apps/desktop/src/app/contrib/wiring.tsx
+index 954975fa63..53682d0cfd 100644
+--- a/apps/desktop/src/app/contrib/wiring.tsx
++++ b/apps/desktop/src/app/contrib/wiring.tsx
+@@ -147,7 +147,7 @@ import { useTranscriptPeerSync } from '../session/hooks/use-transcript-peer-sync
+ import { startWorkspaceSession } from '../session/workspace-session-target'
+ import { PluginInstallModal } from '../settings/plugin-install-modal'
+ import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
+-import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
++import { useWindowControlsOverlayInsets } from '../shell/hooks/use-window-controls-overlay-width'
+ import {
+   TITLEBAR_CHROME_CHANGED_EVENT,
+   titlebarControlsPosition,
+@@ -1215,11 +1215,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
+   const leftTitlebarTools = useTitlebarToolContributions('left')
+   const rightTitlebarTools = useTitlebarToolContributions('right')
+   const connection = useStore($connection)
+-  const controlsPos = titlebarControlsPosition(connection?.windowButtonPosition, Boolean(connection?.isFullscreen))
+-  // Windows/WSLg reserve native min/max/close on the right (AppShell parity:
+-  // prefer the live WCO measurement, fall back to the static reservation).
+-  const measuredOverlayWidth = useWindowControlsOverlayWidth()
+-  const nativeOverlayWidth = measuredOverlayWidth ?? connection?.nativeOverlayWidth ?? 0
++  const overlayInsets = useWindowControlsOverlayInsets()
++
++  const controlsPos = titlebarControlsPosition(
++    connection?.windowButtonPosition,
++    Boolean(connection?.isFullscreen),
++    overlayInsets?.left ?? 0
++  )
++
++  const nativeOverlayWidth = overlayInsets?.right ?? connection?.nativeOverlayWidth ?? 0
+ 
+   const titlebarChrome = {
+     darwinMajor: connection?.darwinMajor ?? 0,
+diff --git a/apps/desktop/src/app/shell/hooks/use-window-controls-overlay-width.ts b/apps/desktop/src/app/shell/hooks/use-window-controls-overlay-width.ts
+index f2411f9951..8c9881b38d 100644
+--- a/apps/desktop/src/app/shell/hooks/use-window-controls-overlay-width.ts
++++ b/apps/desktop/src/app/shell/hooks/use-window-controls-overlay-width.ts
+@@ -1,18 +1,5 @@
+ import { useEffect, useState } from 'react'
+ 
+-// Measure the EXACT width of the native window-controls overlay (min/max/close)
+-// straight from the browser, instead of a hardcoded reservation.
+-//
+-// When Electron's Window Controls Overlay is active (native Windows AND WSLg),
+-// Chromium exposes `navigator.windowControlsOverlay`. Its getTitlebarAreaRect()
+-// returns the draggable title-bar rect that EXCLUDES the controls, so the
+-// controls' width on the right is `innerWidth - rect.right`. This is precise and
+-// self-correcting across DPI / host themes / window states — no magic numbers,
+-// and it sidesteps the WSLg-vs-Windows footprint guesswork.
+-//
+-// Returns null when WCO is unavailable (macOS, plain Linux, or before first
+-// layout), so callers fall back to the static reservation from the main process.
+-
+ interface WindowControlsOverlayLike {
+   visible: boolean
+   getTitlebarAreaRect: () => DOMRect
+@@ -20,28 +7,37 @@ interface WindowControlsOverlayLike {
+   removeEventListener: (type: 'geometrychange', cb: () => void) => void
+ }
+ 
++export interface WindowControlsOverlayInsets {
++  left: number
++  right: number
++}
++
+ const overlay = () =>
+   (navigator as Navigator & { windowControlsOverlay?: WindowControlsOverlayLike }).windowControlsOverlay ?? null
+ 
+-function measure(wco: WindowControlsOverlayLike | null): number | null {
++/** WCO's safe titlebar rect excludes native controls on either (or both) sides. */
++export function windowControlsOverlayInsets(
++  wco: WindowControlsOverlayLike | null,
++  viewportWidth: number
++): WindowControlsOverlayInsets | null {
+   const rect = wco?.visible ? wco.getTitlebarAreaRect() : null
+ 
+-  // No overlay, or it isn't laid out yet.
+   if (!rect?.width) {
+     return null
+   }
+ 
+-  const width = Math.round(window.innerWidth - rect.right)
+-
+-  return width > 0 ? width : null
++  // A measured zero is authoritative, not a reason to use a right-side fallback.
++  return {
++    left: Math.max(0, Math.round(rect.left)),
++    right: Math.max(0, Math.round(viewportWidth - rect.right))
++  }
+ }
+ 
+-/**
+- * Live width (px) of the right-side native window-controls overlay, or null when
+- * the platform/build exposes no overlay (caller should use the static fallback).
+- */
+-export function useWindowControlsOverlayWidth(): number | null {
+-  const [width, setWidth] = useState<number | null>(() => measure(overlay()))
++/** null keeps the native fallback until WCO publishes its first usable geometry. */
++export function useWindowControlsOverlayInsets(): WindowControlsOverlayInsets | null {
++  const [insets, setInsets] = useState<WindowControlsOverlayInsets | null>(() =>
++    windowControlsOverlayInsets(overlay(), window.innerWidth)
++  )
+ 
+   useEffect(() => {
+     const wco = overlay()
+@@ -50,10 +46,12 @@ export function useWindowControlsOverlayWidth(): number | null {
+       return
+     }
+ 
+-    const update = () => setWidth(measure(wco))
++    const update = () => {
++      const next = windowControlsOverlayInsets(wco, window.innerWidth)
++
++      setInsets(previous => (previous?.left === next?.left && previous?.right === next?.right ? previous : next))
++    }
+ 
+-    // Re-measure on overlay geometry changes (maximize/restore, DPI) and on
+-    // window resize (innerWidth feeds the calc).
+     wco.addEventListener('geometrychange', update)
+     window.addEventListener('resize', update)
+     update()
+@@ -64,5 +62,5 @@ export function useWindowControlsOverlayWidth(): number | null {
+     }
+   }, [])
+ 
+-  return width
++  return insets
+ }
+diff --git a/apps/desktop/src/app/shell/titlebar.test.ts b/apps/desktop/src/app/shell/titlebar.test.ts
+index b66908ffaf..21f71bd63d 100644
+--- a/apps/desktop/src/app/shell/titlebar.test.ts
++++ b/apps/desktop/src/app/shell/titlebar.test.ts
+@@ -24,6 +24,16 @@ describe('titlebarControlsPosition', () => {
+     expect(titlebarControlsPosition(null).left).toBe(TITLEBAR_EDGE_INSET)
+   })
+ 
++  it('clears native controls on the left without moving the system buttons', () => {
++    const position = titlebarControlsPosition(null, false, 72)
++
++    expect(position.left).toBe(72 + TITLEBAR_EDGE_INSET)
++  })
++
++  it('drops the left native reservation when fullscreen hides the controls', () => {
++    expect(titlebarControlsPosition(null, true, 72).left).toBe(TITLEBAR_EDGE_INSET)
++  })
++
+   it('uses the macOS fallback while the initial window state is unknown', () => {
+     expect(titlebarControlsPosition(undefined).left).toBe(TITLEBAR_FALLBACK_WINDOW_BUTTON_X + TITLEBAR_CONTROL_OFFSET_X)
+   })
+diff --git a/apps/desktop/src/app/shell/titlebar.ts b/apps/desktop/src/app/shell/titlebar.ts
+index 83201088c6..95245cfd9a 100644
+--- a/apps/desktop/src/app/shell/titlebar.ts
++++ b/apps/desktop/src/app/shell/titlebar.ts
+@@ -92,12 +92,19 @@ export const titlebarHeaderShadowClass =
+ 
+ export function titlebarControlsPosition(
+   windowButtonPosition: HermesConnection['windowButtonPosition'] | undefined,
+-  isFullscreen = false
++  isFullscreen = false,
++  nativeLeftInset = 0
+ ) {
+   const top = Math.max(0, TITLEBAR_CONTROLS_TOP)
+ 
++  // Linux window controls may lead or trail the titlebar. WCO reports their
++  // actual occupied area; keep app tools beyond it instead of moving GTK's buttons.
++  if (!isFullscreen && nativeLeftInset > 0) {
++    return { left: nativeLeftInset + TITLEBAR_EDGE_INSET, top }
++  }
++
+   // No left-side native controls to dodge:
+-  //   - Windows/Linux: native min/max/close render on the right via titleBarOverlay.
++  //   - Windows/Linux without a leading WCO reservation.
+   //   - macOS fullscreen: traffic lights are hidden.
+   // In both cases, pin the cluster to the edge with a small inset.
+   if (windowButtonPosition === null || isFullscreen) {
+diff --git a/apps/shared/src/translucency.ts b/apps/shared/src/translucency.ts
+index ed3af92abe..3a7985e25d 100644
+--- a/apps/shared/src/translucency.ts
++++ b/apps/shared/src/translucency.ts
+@@ -7,7 +7,7 @@
+  *
+  * - 'clear' — the main process maps the lever to native window opacity
+  *   (`setOpacity`), so the whole window fades, text included. macOS + Windows;
+- *   `setOpacity` is a no-op on Linux.
++ *   Linux keeps native opacity at 1 because the setting is not offered there.
+  * - 'glass' — the window stays fully opaque at the native level and the
+  *   renderer thins its page surfaces instead, letting a platform material
+  *   read as a matte blur while text keeps full contrast. macOS rides
+@@ -142,8 +142,8 @@ const DEFAULT_VALUES: Record<'mac' | 'windows', Record<Appearance, TranslucencyV
+ }
+ 
+ /**
+- * The untouched values for an appearance on this platform. Linux never reaches
+- * here — translucency is unsupported there, so nothing resolves.
++ * The untouched values for an appearance on this platform family. Unsupported
++ * platforms may still resolve these values; native opacity is gated separately.
+  */
+ export function defaultTranslucencyValues(appearance: Appearance, isWindows: boolean): TranslucencyValues {
+   return DEFAULT_VALUES[isWindows ? 'windows' : 'mac'][appearance]
+@@ -194,10 +194,9 @@ export function clampIntensity(value: unknown): number {
+ }
+ 
+ /**
+- * Whether this OS can do ANY translucency. Clear rides `setOpacity`, which
+- * Electron documents as doing nothing on Linux, and glass needs a native
+- * material Linux does not have — so the whole setting is dead there and the
+- * row should not be shown at all.
++ * Whether this app offers translucency on the OS. Linux has no first-party
++ * glass material, so the setting stays hidden there. Gate native opacity with
++ * the same policy: newer Electron versions can apply `setOpacity` on Linux.
+  */
+ export function translucencySupportedOn(platform: string): boolean {
+   return platform === 'darwin' || platform === 'win32'
+@@ -387,7 +386,8 @@ function opacityRamp(lever: number): number {
+ }
+ 
+ /**
+- * Native window opacity for a state.
++ * Native window opacity for a state on a platform. Unsupported platforms stay
++ * fully opaque even when persisted or renderer state carries a nonzero lever.
+  *
+  * Under Clear the lever IS the opacity. Under Glass the lever paints the tint
+  * and only the separate `fade` reaches the window, so a glass window stays at
+@@ -400,7 +400,13 @@ function opacityRamp(lever: number): number {
+  * turned the tint to zero — leaving a window that asked to be opaque sitting
+  * at 0.9999. Off has to mean off.
+  */
+-export function windowOpacityFor(state: TranslucencyState): number {
++export function windowOpacityFor(state: TranslucencyState, platform: string): number {
++  // The setting is hidden on unsupported platforms. Old persisted values and
++  // renderer defaults must not become an implicit fade after an Electron update.
++  if (!translucencySupportedOn(platform)) {
++    return 1
++  }
++
+   if (state.mode !== 'glass') {
+     return opacityRamp(state.intensity)
+   }
+diff --git a/apps/desktop/electron/translucency-platform.test.ts b/apps/desktop/electron/translucency-platform.test.ts
+new file mode 100644
+index 0000000000..f3652717d1
+--- /dev/null
++++ b/apps/desktop/electron/translucency-platform.test.ts
+@@ -0,0 +1,67 @@
++import { describe, expect, it } from 'vitest'
++
++import { defaultTranslucencyState, normalizeState, windowOpacityFor, windowOpacityOptions } from './translucency'
++
++const legacyLinuxState = normalizeState({ mode: 'clear', intensity: 29, fade: 0 }, false)
++
++describe('unsupported-platform native opacity', () => {
++  it('keeps an old Linux setting fully opaque at runtime', () => {
++    expect(windowOpacityFor(legacyLinuxState, 'linux')).toBe(1)
++  })
++
++  it('never requests a faded Linux window at construction', () => {
++    expect(windowOpacityOptions(legacyLinuxState, 'linux')).toStrictEqual({})
++  })
++
++  it('keeps fresh Linux defaults opaque in either appearance', () => {
++    for (const appearance of ['light', 'dark'] as const) {
++      const state = defaultTranslucencyState(appearance, false, false)
++
++      expect(windowOpacityFor(state, 'linux')).toBe(1)
++      expect(windowOpacityOptions(state, 'linux')).toStrictEqual({})
++    }
++  })
++
++  it.each(['linux', 'freebsd'])('ignores every clear intensity or glass fade on %s', platform => {
++    for (let lever = 0; lever <= 100; lever += 1) {
++      for (const state of [
++        { ...legacyLinuxState, intensity: lever },
++        { ...legacyLinuxState, mode: 'glass' as const, intensity: 29, fade: lever }
++      ]) {
++        expect(windowOpacityFor(state, platform)).toBe(1)
++        expect(windowOpacityOptions(state, platform)).toStrictEqual({})
++      }
++    }
++  })
++
++  it('does not let stale renderer updates change native opacity on Linux', () => {
++    const previous = windowOpacityFor(legacyLinuxState, 'linux')
++    const updated = normalizeState({ mode: 'glass', intensity: 100, fade: 100 }, false)
++
++    expect(windowOpacityFor(updated, 'linux')).toBe(previous)
++    expect(legacyLinuxState).toMatchObject({ mode: 'clear', intensity: 29, fade: 0 })
++    expect(updated).toMatchObject({ mode: 'clear', intensity: 100, fade: 100 })
++  })
++})
++
++describe.each(['darwin', 'win32'])('supported-platform native opacity on %s', platform => {
++  it('preserves the existing clear intensity ramp', () => {
++    for (const intensity of [0, 1, 29, 100]) {
++      const state = { ...legacyLinuxState, intensity }
++      const expected = 1 - 0.7 * (intensity / 100) ** 2
++
++      expect(windowOpacityFor(state, platform)).toBe(expected)
++      expect(windowOpacityOptions(state, platform)).toStrictEqual(intensity === 0 ? {} : { opacity: expected })
++    }
++  })
++
++  it('keeps glass unfaded until its separate fade lever is raised', () => {
++    const state = { ...legacyLinuxState, mode: 'glass' as const }
++
++    expect(windowOpacityFor(state, platform)).toBe(1)
++    expect(windowOpacityOptions(state, platform)).toStrictEqual({})
++    expect(windowOpacityFor({ ...state, fade: 29 }, platform)).toBe(0.94113)
++    expect(windowOpacityOptions({ ...state, fade: 29 }, platform)).toStrictEqual({ opacity: 0.94113 })
++    expect(windowOpacityFor({ ...state, intensity: 0, fade: 29 }, platform)).toBe(1)
++  })
++})
+diff --git a/apps/desktop/src/app/shell/hooks/use-window-controls-overlay-width.test.ts b/apps/desktop/src/app/shell/hooks/use-window-controls-overlay-width.test.ts
+new file mode 100644
+index 0000000000..a2fe86a0e8
+--- /dev/null
++++ b/apps/desktop/src/app/shell/hooks/use-window-controls-overlay-width.test.ts
+@@ -0,0 +1,78 @@
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { useWindowControlsOverlayInsets } from './use-window-controls-overlay-width'
++
++class Overlay extends EventTarget {
++  visible = true
++  rect = new DOMRect(72, 0, 928, 34)
++
++  getTitlebarAreaRect() {
++    return this.rect
++  }
++}
++
++function install(overlay: Overlay) {
++  vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(1000)
++  Object.defineProperty(navigator, 'windowControlsOverlay', { configurable: true, value: overlay })
++}
++
++afterEach(() => {
++  cleanup()
++  vi.restoreAllMocks()
++  Reflect.deleteProperty(navigator, 'windowControlsOverlay')
++})
++
++describe('native titlebar reservations', () => {
++  it('reserves the left controls and keeps a measured zero on the right', () => {
++    install(new Overlay())
++
++    const { result } = renderHook(() => useWindowControlsOverlayInsets())
++
++    expect(result.current).toEqual({ left: 72, right: 0 })
++  })
++
++  it('tracks controls on either side after geometry changes and resize', () => {
++    const overlay = new Overlay()
++
++    install(overlay)
++
++    const { result, unmount } = renderHook(() => useWindowControlsOverlayInsets())
++
++    act(() => {
++      overlay.rect = new DOMRect(0, 0, 904, 34)
++      overlay.dispatchEvent(new Event('geometrychange'))
++    })
++    expect(result.current).toEqual({ left: 0, right: 96 })
++
++    act(() => {
++      overlay.rect = new DOMRect(48, 0, 880, 34)
++      window.dispatchEvent(new Event('resize'))
++    })
++    expect(result.current).toEqual({ left: 48, right: 72 })
++
++    const removeOverlay = vi.spyOn(overlay, 'removeEventListener')
++    const removeWindow = vi.spyOn(window, 'removeEventListener')
++
++    unmount()
++    expect(removeOverlay).toHaveBeenCalledWith('geometrychange', expect.any(Function))
++    expect(removeWindow).toHaveBeenCalledWith('resize', expect.any(Function))
++  })
++
++  it('keeps the fallback when the native overlay has no usable geometry', () => {
++    const overlay = new Overlay()
++
++    overlay.visible = false
++    install(overlay)
++
++    const { result } = renderHook(() => useWindowControlsOverlayInsets())
++
++    expect(result.current).toBeNull()
++    act(() => {
++      overlay.visible = true
++      overlay.rect = new DOMRect(0, 0, 0, 0)
++      overlay.dispatchEvent(new Event('geometrychange'))
++    })
++    expect(result.current).toBeNull()
++  })
++})

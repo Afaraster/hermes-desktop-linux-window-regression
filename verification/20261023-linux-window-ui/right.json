@@ -1,0 +1,26 @@
+{
+  "insets": {
+    "left": 0,
+    "right": 72
+  },
+  "position": {
+    "left": 14,
+    "top": 5
+  },
+  "button": {
+    "x": 14,
+    "y": 5,
+    "width": 24,
+    "height": 24,
+    "top": 5,
+    "right": 38,
+    "bottom": 29,
+    "left": 14
+  },
+  "electron": "44.9.3",
+  "constructorOpacity": 1,
+  "staleRendererOpacity": 1,
+  "restoredOpacity": 1,
+  "opacityPass": true,
+  "pass": true
+}
